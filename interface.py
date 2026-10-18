@@ -214,6 +214,7 @@ def run_script(shutter: AutoShutter, lines: Iterable[str]) -> None:
 def interactive_terminal(shutter: AutoShutter) -> None:
     """Run an interactive terminal backed by one persistent serial connection."""
     stopped = threading.Event()
+    prompt = "shutter> "
 
     def print_responses() -> None:
         while not stopped.is_set():
@@ -226,7 +227,9 @@ def interactive_terminal(shutter: AutoShutter) -> None:
                     print(f"Serial error: {exc}")
                 return
             if response:
-                print(f"\n{response}")
+                # Responses such as DONE arrive while input() owns the line.
+                # Redraw the prompt so the terminal does not look stuck.
+                print(f"\n{response}\n{prompt}", end="", flush=True)
 
     reader = threading.Thread(target=print_responses, daemon=True)
     reader.start()
@@ -236,7 +239,7 @@ def interactive_terminal(shutter: AutoShutter) -> None:
     try:
         while True:
             try:
-                line = input("shutter> ").strip()
+                line = input(prompt).strip()
             except EOFError:
                 break
             if not line:

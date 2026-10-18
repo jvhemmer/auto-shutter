@@ -79,6 +79,14 @@ class DiscoveryTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "between 50 and 2000"):
             shutter.set_speed(10)
 
+    def test_negative_angle_is_sent_with_minus_sign(self):
+        connection = FakeSerial("COM5", interface.BAUD_RATE, 1, 1)
+        connection.responses = iter([b"MOVING\n"])
+        shutter = interface.AutoShutter(connection)
+
+        self.assertEqual(shutter.move(-90), "MOVING")
+        self.assertEqual(connection.writes, [b"MOVE -90\n"])
+
     @patch("interface.time.sleep", return_value=None)
     def test_runs_command_script_on_one_connection(self, sleep):
         connection = FakeSerial("COM5", interface.BAUD_RATE, 1, 1)
