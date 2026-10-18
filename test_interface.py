@@ -13,12 +13,16 @@ class FakeSerial:
         self.port = port
         self.timeout = timeout
         self.is_open = True
-        self.responses = iter(self.responses_by_port[port])
+        self.responses = iter(self.responses_by_port.get(port, []))
         self.writes = []
         self.instances.append(self)
 
     def reset_input_buffer(self):
         pass
+
+    @property
+    def in_waiting(self):
+        return 0
 
     def write(self, data):
         self.writes.append(data)
@@ -56,6 +60,48 @@ class DiscoveryTests(unittest.TestCase):
         self.assertTrue(connection.is_open)
         self.assertEqual(connection.writes, [b"ID\n"])
         self.assertFalse(FakeSerial.instances[0].is_open)
+
+    @patch("interface.time.sleep", return_value=None)
+    def test_speed_retries_after_dropped_windows_command(self, _sleep):
+        connection = FakeSerial("COM5", interface.BAUD_RATE, 1, 1)
+        connection.responses = iter([b"", b"SPEED SET\r\n"])
+        shutter = interface.AutoShutter(connection)
+
+        response = shutter.set_speed(100)
+
+        self.assertEqual(response, "SPEED SET")
+        self.assertEqual(connection.writes, [b"SPEED 100\n", b"SPEED 100\n"])
+
+    def test_speed_rejects_values_outside_firmware_range(self):
+        connection = FakeSerial("COM5", interface.BAUD_RATE, 1, 1)
+        shutter = interface.AutoShutter(connection)
+
+        with self.assertRaisesRegex(ValueError, "between 50 and 2000"):
+            shutter.set_speed(10)
+
+    @patch("interface.time.sleep", return_value=None)
+    def test_runs_command_script_on_one_connection(self, sleep):
+        connection = FakeSerial("COM5", interface.BAUD_RATE, 1, 1)
+        connection.responses = iter([b"SPEED SET\n", b"MOVING\n", b"STOPPED\n"])
+        shutter = interface.AutoShutter(connection)
+
+        interface.run_script(
+            shutter,
+            ["# preset\n", "SPEED 100\n", "MOVE 90\n", "WAIT 2.5\n", "STOP\n"],
+        )
+
+        self.assertEqual(
+            connection.writes,
+            [b"SPEED 100\n", b"MOVE 90\n", b"STOP\n"],
+        )
+        sleep.assert_called_once_with(2.5)
+
+    def test_script_reports_bad_line_number(self):
+        connection = FakeSerial("COM5", interface.BAUD_RATE, 1, 1)
+        shutter = interface.AutoShutter(connection)
+
+        with self.assertRaisesRegex(ValueError, "script line 2"):
+            interface.run_script(shutter, ["# preset\n", "OPEN\n"])
 
     @patch("interface.time.sleep", return_value=None)
     @patch("interface.serial.Serial", FakeSerial)

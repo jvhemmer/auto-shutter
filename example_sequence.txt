@@ -1,0 +1,6 @@
+# Example preset using one persistent serial connection.
+SPEED 100
+MOVE 90
+WAIT 5
+MOVE -90
+WAIT 5

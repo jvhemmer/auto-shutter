@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import argparse
 import os
+import threading
 import time
 from collections.abc import Iterable
+from pathlib import Path
 
 import serial
 from serial.tools import list_ports
@@ -14,6 +16,7 @@ from serial.tools import list_ports
 BAUD_RATE = 115200
 DEVICE_ID = "AUTO_SHUTTER_V1"
 PORT_ENV_VAR = "AUTO_SHUTTER_PORT"
+SPEED_RETRIES = 3
 
 
 class ShutterNotFoundError(ConnectionError):
@@ -120,7 +123,27 @@ class AutoShutter:
         return self.command("STOP")
 
     def set_speed(self, microsteps_per_second: int) -> str:
-        return self.command(f"SPEED {microsteps_per_second}")
+        if not 50 <= microsteps_per_second <= 2000:
+            raise ValueError("speed must be between 50 and 2000 microsteps per second")
+
+        # Some Windows USB-serial drivers can lose the first command sent
+        # immediately after identification. SPEED is safe to retry because
+        # setting the same value more than once has no additional effect.
+        last_response = ""
+        for attempt in range(SPEED_RETRIES):
+            response = self.command(f"SPEED {microsteps_per_second}")
+            if response == "SPEED SET":
+                return response
+            if response == "INVALID SPEED":
+                raise ValueError("controller rejected speed")
+            last_response = response
+            if attempt < SPEED_RETRIES - 1:
+                time.sleep(0.1)
+
+        detail = f"; last response was {last_response!r}" if last_response else ""
+        raise TimeoutError(
+            f"Controller did not acknowledge SPEED after {SPEED_RETRIES} attempts{detail}"
+        )
 
     def close(self) -> None:
         self.serial.close()
@@ -132,18 +155,138 @@ class AutoShutter:
         self.close()
 
 
+def run_script(shutter: AutoShutter, lines: Iterable[str]) -> None:
+    """Run shutter commands from an iterable while keeping one connection open.
+
+    Supported device commands are ``SPEED``, ``MOVE``, ``STOP``, and ``ID``.
+    ``WAIT <seconds>`` pauses on the host without closing the serial port.
+    Blank lines and lines starting with ``#`` are ignored.
+    """
+    for line_number, source_line in enumerate(lines, start=1):
+        line = source_line.strip()
+        if not line or line.startswith("#"):
+            continue
+
+        command, *arguments = line.split(maxsplit=1)
+        command = command.upper()
+        argument = arguments[0] if arguments else ""
+
+        try:
+            if command == "WAIT":
+                seconds = float(argument)
+                if seconds < 0:
+                    raise ValueError("WAIT duration cannot be negative")
+                print(f"> WAIT {seconds:g}")
+                time.sleep(seconds)
+                # Movement completion is asynchronous. Drain messages such as
+                # DONE now so they cannot be mistaken for the next command's
+                # acknowledgement.
+                while shutter.serial.in_waiting:
+                    response = shutter.serial.readline().decode(
+                        "ascii", errors="replace"
+                    ).strip()
+                    if response:
+                        print(response)
+                continue
+
+            if command == "SPEED":
+                speed = int(argument)
+                print(f"> SPEED {speed}")
+                print(shutter.set_speed(speed))
+                continue
+
+            if command == "MOVE":
+                angle = float(argument)
+                text = f"MOVE {angle:g}"
+            elif command in {"STOP", "ID"} and not argument:
+                text = command
+            else:
+                raise ValueError(f"unsupported command: {line!r}")
+
+            print(f"> {text}")
+            response = shutter.command(text)
+            if response:
+                print(response)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"script line {line_number}: {exc}") from exc
+
+
+def interactive_terminal(shutter: AutoShutter) -> None:
+    """Run an interactive terminal backed by one persistent serial connection."""
+    stopped = threading.Event()
+
+    def print_responses() -> None:
+        while not stopped.is_set():
+            try:
+                response = shutter.serial.readline().decode(
+                    "ascii", errors="replace"
+                ).strip()
+            except (OSError, serial.SerialException) as exc:
+                if not stopped.is_set():
+                    print(f"Serial error: {exc}")
+                return
+            if response:
+                print(f"\n{response}")
+
+    reader = threading.Thread(target=print_responses, daemon=True)
+    reader.start()
+    help_text = "Commands: SPEED <50-2000>, MOVE <angle>, STOP, ID, HELP, EXIT"
+    print(help_text)
+
+    try:
+        while True:
+            try:
+                line = input("shutter> ").strip()
+            except EOFError:
+                break
+            if not line:
+                continue
+            if line.upper() in {"EXIT", "QUIT"}:
+                break
+            if line.upper() == "HELP":
+                print(help_text)
+                continue
+
+            command, *arguments = line.split(maxsplit=1)
+            command = command.upper()
+            if command not in {"SPEED", "MOVE", "STOP", "ID"}:
+                print(f"Unsupported command: {command}. Enter HELP for commands.")
+                continue
+            text = command + (f" {arguments[0]}" if arguments else "")
+            shutter.serial.write((text + "\n").encode("ascii"))
+            shutter.serial.flush()
+    except KeyboardInterrupt:
+        print()
+    finally:
+        stopped.set()
+        reader.join(timeout=1.1)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Control the Auto Shutter")
     parser.add_argument("--port", help="serial port override (normally auto-detected)")
-    parser.add_argument("--speed", type=int, default=500, help="microsteps per second")
+    parser.add_argument("--speed", type=int, help="microsteps per second")
+    parser.add_argument("--script", type=Path, help="run commands from a file")
     parser.add_argument("angle", type=float, nargs="?", help="angle to move in degrees")
     args = parser.parse_args()
 
+    if args.script is not None and args.angle is not None:
+        parser.error("angle and --script cannot be used together")
+
     with AutoShutter.connect(args.port) as shutter:
         print(f"Connected to {shutter.port}")
-        print(shutter.set_speed(args.speed))
-        if args.angle is not None:
+        if args.script is not None:
+            if args.speed is not None:
+                print(shutter.set_speed(args.speed))
+            with args.script.open(encoding="utf-8") as script:
+                run_script(shutter, script)
+        elif args.angle is not None:
+            print(shutter.set_speed(args.speed if args.speed is not None else 500))
             print(shutter.move(args.angle))
+        else:
+            if args.speed is not None:
+                print(shutter.set_speed(args.speed))
+            interactive_terminal(shutter)
 
 
 if __name__ == "__main__":
