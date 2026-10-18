@@ -1,5 +1,4 @@
-def main():
-    print("Hello from auto-shutter!")
+from interface import main
 
 
 if __name__ == "__main__":

@@ -18,6 +18,7 @@
  */
 
 const unsigned long BAUD_RATE = 115200; 
+const char DEVICE_ID[] = "AUTO_SHUTTER_V1";
 
 const int STEP_PIN = 2;
 const int DIR_PIN = 3;
@@ -50,7 +51,12 @@ void loop() {
     String cmd = Serial.readStringUntil('\n');
     cmd.trim();
 
-    if (cmd.startsWith("MOVE ")) {
+    if (cmd == "ID") {
+      // Stable handshake used by host software for cross-platform discovery.
+      Serial.println(DEVICE_ID);
+    }
+
+    else if (cmd.startsWith("MOVE ")) {
       float angle = cmd.substring(5).toFloat();
 
       // Round to nearest microstep
