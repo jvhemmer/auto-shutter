@@ -35,23 +35,26 @@ MOVING
 DONE
 shutter> STOP
 STOPPED
+shutter> SCRIPT example_sequence.txt
 shutter> EXIT
 ```
 
 This avoids reopening and resetting the Arduino between commands. `EXIT`,
-`QUIT`, Ctrl+C, or end-of-input closes the connection.
+`QUIT`, Ctrl+C, or end-of-input closes the connection. `SCRIPT <path>` runs a
+command file through the same open connection, then returns to the prompt.
 
 ## Command scripts
 
 Store one command per line. `WAIT` is a host-side delay in seconds; comments
-start with `#`.
+start with `#`. `LOOP N` repeats its indented block `N` times. Tabs and spaces
+are accepted for indentation, and loops can be nested.
 
 ```text
-SPEED 100
-MOVE 90
-WAIT 5
+SPEED 250
+LOOP 5
+    MOVE 90
+    WAIT 5
 MOVE -90
-WAIT 5
 ```
 
 Run the file through one persistent connection:

@@ -104,6 +104,38 @@ class DiscoveryTests(unittest.TestCase):
         )
         sleep.assert_called_once_with(2.5)
 
+    @patch("interface.time.sleep", return_value=None)
+    def test_script_loop_repeats_only_indented_block(self, sleep):
+        connection = FakeSerial("COM5", interface.BAUD_RATE, 1, 1)
+        connection.responses = iter(
+            [b"SPEED SET\n", b"MOVING\n", b"MOVING\n", b"MOVING\n"]
+        )
+        shutter = interface.AutoShutter(connection)
+
+        interface.run_script(
+            shutter,
+            [
+                "SPEED 250\n",
+                "LOOP 2\n",
+                "\tMOVE 90\n",
+                "\tWAIT 5\n",
+                "MOVE -90\n",
+            ],
+        )
+
+        self.assertEqual(
+            connection.writes,
+            [b"SPEED 250\n", b"MOVE 90\n", b"MOVE 90\n", b"MOVE -90\n"],
+        )
+        self.assertEqual(sleep.call_count, 2)
+
+    def test_script_loop_requires_indented_block(self):
+        connection = FakeSerial("COM5", interface.BAUD_RATE, 1, 1)
+        shutter = interface.AutoShutter(connection)
+
+        with self.assertRaisesRegex(ValueError, "script line 1.*indented block"):
+            interface.run_script(shutter, ["LOOP 2\n", "MOVE 90\n"])
+
     def test_script_reports_bad_line_number(self):
         connection = FakeSerial("COM5", interface.BAUD_RATE, 1, 1)
         shutter = interface.AutoShutter(connection)

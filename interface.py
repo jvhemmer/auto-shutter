@@ -7,6 +7,7 @@ import os
 import threading
 import time
 from collections.abc import Iterable
+from dataclasses import dataclass
 from pathlib import Path
 
 import serial
@@ -155,85 +156,178 @@ class AutoShutter:
         self.close()
 
 
+@dataclass(frozen=True)
+class _ScriptCommand:
+    line_number: int
+    text: str
+
+
+@dataclass(frozen=True)
+class _ScriptLoop:
+    line_number: int
+    count: int
+    commands: list[_ScriptCommand | _ScriptLoop]
+
+
+def _parse_script(lines: Iterable[str]) -> list[_ScriptCommand | _ScriptLoop]:
+    source: list[tuple[int, int, str]] = []
+    for line_number, source_line in enumerate(lines, start=1):
+        expanded = source_line.expandtabs(4).rstrip()
+        text = expanded.lstrip(" ")
+        if not text or text.startswith("#"):
+            continue
+        source.append((line_number, len(expanded) - len(text), text))
+
+    if source and source[0][1] != 0:
+        raise ValueError(f"script line {source[0][0]}: unexpected indentation")
+
+    def parse_block(
+        index: int, indentation: int
+    ) -> tuple[list[_ScriptCommand | _ScriptLoop], int]:
+        commands: list[_ScriptCommand | _ScriptLoop] = []
+        while index < len(source):
+            line_number, current_indentation, text = source[index]
+            if current_indentation < indentation:
+                break
+            if current_indentation > indentation:
+                raise ValueError(f"script line {line_number}: unexpected indentation")
+
+            command, *arguments = text.split(maxsplit=1)
+            if command.upper() != "LOOP":
+                commands.append(_ScriptCommand(line_number, text))
+                index += 1
+                continue
+
+            if not arguments:
+                raise ValueError(f"script line {line_number}: LOOP requires a count")
+            try:
+                count = int(arguments[0])
+            except ValueError as exc:
+                raise ValueError(
+                    f"script line {line_number}: LOOP count must be an integer"
+                ) from exc
+            if count < 0:
+                raise ValueError(
+                    f"script line {line_number}: LOOP count cannot be negative"
+                )
+            if index + 1 >= len(source) or source[index + 1][1] <= indentation:
+                raise ValueError(
+                    f"script line {line_number}: LOOP requires an indented block"
+                )
+
+            child_indentation = source[index + 1][1]
+            body, index = parse_block(index + 1, child_indentation)
+            commands.append(_ScriptLoop(line_number, count, body))
+        return commands, index
+
+    commands, _ = parse_block(0, 0)
+    return commands
+
+
+def _run_script_command(shutter: AutoShutter, command: _ScriptCommand) -> None:
+    line = command.text
+    name, *arguments = line.split(maxsplit=1)
+    name = name.upper()
+    argument = arguments[0] if arguments else ""
+
+    try:
+        if name == "WAIT":
+            seconds = float(argument)
+            if seconds < 0:
+                raise ValueError("WAIT duration cannot be negative")
+            print(f"> WAIT {seconds:g}")
+            time.sleep(seconds)
+            # Movement completion is asynchronous. Drain messages such as
+            # DONE now so they cannot be mistaken for the next command's
+            # acknowledgement.
+            while shutter.serial.in_waiting:
+                response = shutter.serial.readline().decode(
+                    "ascii", errors="replace"
+                ).strip()
+                if response:
+                    print(response)
+            return
+
+        if name == "SPEED":
+            speed = int(argument)
+            print(f"> SPEED {speed}")
+            print(shutter.set_speed(speed))
+            return
+
+        if name == "MOVE":
+            angle = float(argument)
+            text = f"MOVE {angle:g}"
+        elif name in {"STOP", "ID"} and not argument:
+            text = name
+        else:
+            raise ValueError(f"unsupported command: {line!r}")
+
+        print(f"> {text}")
+        response = shutter.command(text)
+        if response:
+            print(response)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"script line {command.line_number}: {exc}") from exc
+
+
+def _run_script_block(
+    shutter: AutoShutter, commands: Iterable[_ScriptCommand | _ScriptLoop]
+) -> None:
+    for command in commands:
+        if isinstance(command, _ScriptLoop):
+            for iteration in range(1, command.count + 1):
+                print(f"> LOOP {iteration}/{command.count}")
+                _run_script_block(shutter, command.commands)
+        else:
+            _run_script_command(shutter, command)
+
+
 def run_script(shutter: AutoShutter, lines: Iterable[str]) -> None:
     """Run shutter commands from an iterable while keeping one connection open.
 
     Supported device commands are ``SPEED``, ``MOVE``, ``STOP``, and ``ID``.
-    ``WAIT <seconds>`` pauses on the host without closing the serial port.
-    Blank lines and lines starting with ``#`` are ignored.
+    ``WAIT <seconds>`` pauses on the host. ``LOOP <count>`` repeats its
+    indented block. Blank lines and lines starting with ``#`` are ignored.
     """
-    for line_number, source_line in enumerate(lines, start=1):
-        line = source_line.strip()
-        if not line or line.startswith("#"):
-            continue
-
-        command, *arguments = line.split(maxsplit=1)
-        command = command.upper()
-        argument = arguments[0] if arguments else ""
-
-        try:
-            if command == "WAIT":
-                seconds = float(argument)
-                if seconds < 0:
-                    raise ValueError("WAIT duration cannot be negative")
-                print(f"> WAIT {seconds:g}")
-                time.sleep(seconds)
-                # Movement completion is asynchronous. Drain messages such as
-                # DONE now so they cannot be mistaken for the next command's
-                # acknowledgement.
-                while shutter.serial.in_waiting:
-                    response = shutter.serial.readline().decode(
-                        "ascii", errors="replace"
-                    ).strip()
-                    if response:
-                        print(response)
-                continue
-
-            if command == "SPEED":
-                speed = int(argument)
-                print(f"> SPEED {speed}")
-                print(shutter.set_speed(speed))
-                continue
-
-            if command == "MOVE":
-                angle = float(argument)
-                text = f"MOVE {angle:g}"
-            elif command in {"STOP", "ID"} and not argument:
-                text = command
-            else:
-                raise ValueError(f"unsupported command: {line!r}")
-
-            print(f"> {text}")
-            response = shutter.command(text)
-            if response:
-                print(response)
-        except (TypeError, ValueError) as exc:
-            raise ValueError(f"script line {line_number}: {exc}") from exc
+    _run_script_block(shutter, _parse_script(lines))
 
 
 def interactive_terminal(shutter: AutoShutter) -> None:
     """Run an interactive terminal backed by one persistent serial connection."""
-    stopped = threading.Event()
     prompt = "shutter> "
 
-    def print_responses() -> None:
-        while not stopped.is_set():
-            try:
-                response = shutter.serial.readline().decode(
-                    "ascii", errors="replace"
-                ).strip()
-            except (OSError, serial.SerialException) as exc:
-                if not stopped.is_set():
-                    print(f"Serial error: {exc}")
-                return
-            if response:
-                # Responses such as DONE arrive while input() owns the line.
-                # Redraw the prompt so the terminal does not look stuck.
-                print(f"\n{response}\n{prompt}", end="", flush=True)
+    def start_reader() -> tuple[threading.Event, threading.Thread]:
+        stopped = threading.Event()
 
-    reader = threading.Thread(target=print_responses, daemon=True)
-    reader.start()
-    help_text = "Commands: SPEED <50-2000>, MOVE <angle>, STOP, ID, HELP, EXIT"
+        def print_responses() -> None:
+            while not stopped.is_set():
+                try:
+                    response = shutter.serial.readline().decode(
+                        "ascii", errors="replace"
+                    ).strip()
+                except (OSError, serial.SerialException) as exc:
+                    if not stopped.is_set():
+                        print(f"Serial error: {exc}")
+                    return
+                if response:
+                    # Responses such as DONE arrive while input() owns the
+                    # line. Redraw the prompt so terminal does not look stuck.
+                    print(f"\n{response}\n{prompt}", end="", flush=True)
+
+        reader = threading.Thread(target=print_responses, daemon=True)
+        reader.start()
+        return stopped, reader
+
+    def stop_reader(reader_state: tuple[threading.Event, threading.Thread]) -> None:
+        stopped, reader = reader_state
+        stopped.set()
+        reader.join(timeout=1.1)
+
+    reader_state = start_reader()
+    help_text = (
+        "Commands: SPEED <50-2000>, MOVE <angle>, STOP, ID, "
+        "SCRIPT <path>, HELP, EXIT"
+    )
     print(help_text)
 
     try:
@@ -252,6 +346,20 @@ def interactive_terminal(shutter: AutoShutter) -> None:
 
             command, *arguments = line.split(maxsplit=1)
             command = command.upper()
+            if command == "SCRIPT":
+                if not arguments:
+                    print("SCRIPT requires a file path.")
+                    continue
+                script_path = Path(arguments[0]).expanduser()
+                stop_reader(reader_state)
+                try:
+                    with script_path.open(encoding="utf-8") as script:
+                        run_script(shutter, script)
+                except (OSError, ValueError) as exc:
+                    print(f"Script error: {exc}")
+                finally:
+                    reader_state = start_reader()
+                continue
             if command not in {"SPEED", "MOVE", "STOP", "ID"}:
                 print(f"Unsupported command: {command}. Enter HELP for commands.")
                 continue
@@ -261,8 +369,7 @@ def interactive_terminal(shutter: AutoShutter) -> None:
     except KeyboardInterrupt:
         print()
     finally:
-        stopped.set()
-        reader.join(timeout=1.1)
+        stop_reader(reader_state)
 
 
 def main() -> None:
